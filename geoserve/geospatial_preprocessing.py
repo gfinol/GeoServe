@@ -19,11 +19,8 @@ NO_DATA_FLOAT = 0.0001
 OFFSET = 0
 PERCENTILE = 99
 
-@serve.deployment
-class PrithviPreprocessor():
+class PrithviPreprocessor:
     def __init__(self, config=None):
-
-        # TODO: Check is datamodule can be reused between requests
         if config is None:
             self.datamodule = self.generate_datamodule_static()
         else:
@@ -47,8 +44,7 @@ class PrithviPreprocessor():
             self.init_object_from_classpath_and_args(t["class_path"], t["init_args"])
             for t in args]
 
-    def generate_datamodule(self, classpath: str, init_args: dict):
-
+    def generate_datamodule(self, classpath: str, init_args: dict) -> Sen1Floods11NonGeoDataModule:
         final_init_args = copy.deepcopy(init_args)
 
         final_init_args["test_transform"] = self.parse_args_list(init_args["test_transform"])
@@ -58,9 +54,7 @@ class PrithviPreprocessor():
         datamodule = self.init_object_from_classpath_and_args(classpath, final_init_args)
         return datamodule
 
-    @staticmethod
-    def _preprocess(x: np.ndarray, img_size: int, location_coords: np.ndarray,
-                    datamodule: Sen1Floods11NonGeoDataModule):
+    def _preprocess(self, x: np.ndarray, img_size: int, location_coords: np.ndarray):
         # Reflect pad if not divisible by img_size
         original_h, original_w = x.shape[-2:]
         pad_h = (img_size - (original_h % img_size)) % img_size
@@ -86,21 +80,10 @@ class PrithviPreprocessor():
         chunks = []
         for x in windows:
             # Apply standardization
-            x = datamodule.test_transform(image=x.squeeze().numpy().transpose(1, 2, 0))
-            x = datamodule.aug(x)['image']
+            x = self.datamodule.test_transform(image=x.squeeze().numpy().transpose(1, 2, 0))
+            x = self.datamodule.aug(x)['image']
 
             chunks.append(x)
-
-            # mm_data = {
-            #     "pixel_values": torch.empty(0) if x is None else x,
-            #     "location_coords": torch.empty(0) if location_coords is None else location_coords,
-            #     "img_size": img_size,
-            #     "h1": h1,
-            #     "w1": w1,
-            #     "original_h": original_h,
-            #     "original_w": original_w,
-            # }
-            # return mm_data
 
         return {
             "pixel_values_chunks": chunks,
@@ -113,7 +96,7 @@ class PrithviPreprocessor():
         }
 
     @staticmethod
-    def generate_datamodule_static():
+    def generate_datamodule_static() -> Sen1Floods11NonGeoDataModule:
         datamodule_config = {
             'bands': ['BLUE',
                       'GREEN',
@@ -249,6 +232,13 @@ class PrithviPreprocessor():
         if input_data.mean() > 1:
             input_data = input_data / 10000
 
-        datamodule = self.generate_datamodule_static()
+        return self._preprocess(input_data, img_size, location_coords)
 
-        return self._preprocess(input_data, img_size, location_coords, datamodule)
+@serve.deployment
+class PrithviPreprocessorDeployment(PrithviPreprocessor):
+    """
+    Ray Serve deployment for the Prithvi preprocessor.
+    """
+
+    def __init__(self, config=None):
+        super().__init__(config)

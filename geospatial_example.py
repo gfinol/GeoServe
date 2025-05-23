@@ -1,8 +1,13 @@
+import datetime
 import os
+import re
+from io import BytesIO
+from typing import Union, List, Tuple
 
 import numpy as np
 import rasterio
 import ray
+import requests
 import torch
 import yaml
 from ray import serve
@@ -11,12 +16,98 @@ from vllm import AsyncEngineArgs
 
 from geoserve.async_llm_engine_support import AsyncLLMEngineDeployment
 from geoserve.geospatial_deployment import GeospatialDeployment
-from geoserve.geospatial_preprocessing import PrithviPreprocessor
+from geoserve.geospatial_preprocessing import PrithviPreprocessorDeployment
 
 NO_DATA = -9999
 NO_DATA_FLOAT = 0.0001
 OFFSET = 0
 PERCENTILE = 99
+
+
+def read_geotiff(file_path: str) -> Tuple[np.ndarray, dict, Tuple[float, float]]:
+    """Read all bands from *file_path* and return image + meta info.
+
+    Args:
+        file_path: path to image file.
+
+    Returns:
+        np.ndarray with shape (bands, height, width)
+        meta info dict
+    """
+
+    if file_path.startswith("http"):
+        response = requests.get(file_path)
+        response.raise_for_status()  # Raise an error for bad responses
+        file = BytesIO(response.content)
+    else:
+        file = file_path
+
+    with rasterio.open(file) as src:
+        img = src.read()
+        meta = src.meta
+        try:
+            coords = src.lnglat()
+        except:
+            # Cannot read coords
+            coords = None
+    return img, meta, coords
+
+def load_example(
+        file_paths: List[str],
+        mean: List[float] = None,
+        std: List[float] = None,
+        indices: Union[list[int], None] = None,
+):
+    """Build an input example by loading images in *file_paths*.
+
+    Args:
+        file_paths: list of file paths .
+        mean: list containing mean values for each band in the images in *file_paths*.
+        std: list containing std values for each band in the images in *file_paths*.
+
+    Returns:
+        np.array containing created example
+        list of meta info for each image in *file_paths*
+    """
+
+    imgs = []
+    metas = []
+    temporal_coords = []
+    location_coords = []
+
+    for file in file_paths:
+        img, meta, coords = read_geotiff(file)
+
+        # Rescaling (don't normalize on nodata)
+        img = np.moveaxis(img, 0, -1)  # channels last for rescaling
+        if indices is not None:
+            img = img[..., indices]
+        if mean is not None and std is not None:
+            img = np.where(img == NO_DATA, NO_DATA_FLOAT, (img - mean) / std)
+
+        imgs.append(img)
+        metas.append(meta)
+        if coords is not None:
+            location_coords.append(coords)
+
+        try:
+            match = re.search(r'(\d{7,8}T\d{6})', file)
+            if match:
+                year = int(match.group(1)[:4])
+                julian_day = match.group(1).split('T')[0][4:]
+                if len(julian_day) == 3:
+                    julian_day = int(julian_day)
+                else:
+                    julian_day = datetime.datetime.strptime(julian_day, '%m%d').timetuple().tm_yday
+                temporal_coords.append([year, julian_day])
+        except Exception as e:
+            print(f'Could not extract timestamp for {file} ({e})')
+
+    imgs = np.stack(imgs, axis=0)  # num_frames, H, W, C
+    imgs = np.moveaxis(imgs, -1, 0).astype("float32")  # C, num_frames, H, W
+    imgs = np.expand_dims(imgs, axis=0)
+
+    return imgs, temporal_coords, location_coords, metas
 
 def process_channel_group(orig_img, channels):
     """
@@ -77,11 +168,11 @@ def main(
     ):
     args = AsyncEngineArgs(model="christian-pinto/Prithvi-EO-2.0-300M-TL-VLLM", skip_tokenizer_init=True, dtype="float32")
     vllm_engine = AsyncLLMEngineDeployment.bind(engine_args=args)
-    preprocessing = PrithviPreprocessor.bind()
+    preprocessing = PrithviPreprocessorDeployment.bind()
     model = GeospatialDeployment.bind(vllm_deployment=vllm_engine, preprocessor_deployment=preprocessing)
 
     try:
-        handle: DeploymentHandle = serve.run(model, name="geospatial-prithvi-example")
+        handle: DeploymentHandle = serve.run(model, name="geospatial-prithvi-example", route_prefix=None)
 
 
         os.makedirs(output_dir, exist_ok=True)
@@ -90,7 +181,7 @@ def main(
             config_dict = yaml.safe_load(f)
 
         # Loading data ---------------------------------------------------------------------------------
-        input_data, temporal_coords, location_coords, meta_data = PrithviPreprocessor.load_example(
+        input_data, temporal_coords, location_coords, meta_data = load_example(
             file_paths=[data_file], indices=input_indices,
         )
 
@@ -146,11 +237,11 @@ def main(
         print("Done!")
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error: {e.with_traceback()}")
 
     finally:
         # Clean up
-        serve.delete("gfinol-geospatial")
+        serve.delete("geospatial-prithvi-example")
         print("Cleaned up resources.")
 
 
