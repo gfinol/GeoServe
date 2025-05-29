@@ -8,6 +8,7 @@ import numpy as np
 import rasterio
 import ray
 import requests
+import aiohttp
 import torch
 import yaml
 from ray import serve
@@ -168,8 +169,8 @@ def main(
     ):
     args = AsyncEngineArgs(model="christian-pinto/Prithvi-EO-2.0-300M-TL-VLLM", skip_tokenizer_init=True, dtype="float32")
     vllm_engine = AsyncLLMEngineDeployment.bind(engine_args=args)
-    preprocessing = PrithviPreprocessorDeployment.bind()
-    model = GeospatialDeployment.bind(vllm_deployment=vllm_engine, preprocessor_deployment=preprocessing)
+    # preprocessing = PrithviPreprocessorDeployment.bind()
+    model = GeospatialDeployment.bind(vllm_deployment=vllm_engine)
 
     try:
         handle: DeploymentHandle = serve.run(model, name="geospatial-prithvi-example", route_prefix=None)

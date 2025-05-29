@@ -1,10 +1,13 @@
+import argparse
+import asyncio
 import copy
 import datetime
 import importlib
 import re
 import uuid
 from io import BytesIO
-from typing import List, Union, Tuple
+from typing import List, Union, Tuple, Any, Coroutine
+import time
 
 import aiohttp
 import albumentations
@@ -24,20 +27,42 @@ NO_DATA = -9999
 NO_DATA_FLOAT = 0.0001
 
 @serve.deployment
-class GeospatialDeployment():
+class GeospatialDeploymentBenchamrk():
 
     def __init__(
             self, vllm_deployment: DeploymentHandle,
+            args: argparse.Namespace,
     ):
         self.vllmDeployment = vllm_deployment.options(stream=True)
         self.id = str(uuid.uuid4())
         self.datamodule = self.generate_datamodule_static()
+        self.args = args
+        self.extra_data = self.alocate_random_bytes(args.extra_data_size) if args.extra_data_size > 0 else None
 
-    async def encode(self, geotiff_path: str) -> Tensor:
+    def get_sleep_time(self):
+        if self.args.sleep_distribution == "uniform":
+            return np.random.uniform(self.args.sleep_min, self.args.sleep_max)
+        elif self.args.sleep_distribution == "fixed":
+            return self.args.sleep_fixed
+        else:
+            return 0.0
+
+    def alocate_random_bytes(self, size: int):
+        """Allocate random bytes of size *size*."""
+        return np.random.default_rng().bytes(size)
+
+    async def encode(self, geotiff_path: str) -> tuple[Tensor, dict[str, int]]:
         # This may be doing some unnecessary data movement
         # preprocessor_response = await self.preprocessorDeployment.apply.remote(geotiff_path)
         # Use it locally, avoid unnecessary data movement
+        start_encode = time.time_ns()
         preprocessor_response = await self.apply(geotiff_path)
+        end_preprocessor = time.time_ns()
+
+        sleep_time = self.get_sleep_time()
+        if sleep_time > 0.0:
+            await asyncio.sleep(sleep_time)
+        end_sleep = time.time_ns()
 
         location_coords = preprocessor_response["location_coords"]
         pixel_values_chunks = preprocessor_response["pixel_values_chunks"]
@@ -48,6 +73,7 @@ class GeospatialDeployment():
         original_h = preprocessor_response["original_h"]
         original_w = preprocessor_response["original_w"]
 
+        submission_timestamps = []
         pred_futures = []
         for pixel_values in pixel_values_chunks:
             mm_data = {
@@ -56,6 +82,9 @@ class GeospatialDeployment():
                 "temporal_coords": torch.empty(0),
             }
 
+            if self.extra_data is not None:
+                mm_data["extra_data"] = self.extra_data
+
             prompt = {
                 "prompt_token_ids": [1],
                 "multi_modal_data": mm_data
@@ -63,15 +92,22 @@ class GeospatialDeployment():
 
             pred = self.vllmDeployment.encode.remote(prompt, SamplingParams(temperature=0.0), uuid.uuid4())
             pred_futures.append(pred)
+            submission_timestamps.append(time.time_ns())
 
+        submitted_all_vllm_tasks = time.time_ns()
+
+        reception_timestamps = []
         pred_imgs = []
         for f in pred_futures:
             request_output: PoolingRequestOutput = await f.__anext__()
+            reception_timestamps.append(time.time_ns())
             pred = request_output.outputs.data
 
             y_hat = pred.argmax(dim=1)
             y_hat = torch.nn.functional.interpolate(y_hat.unsqueeze(1).float(), size=img_size, mode="nearest")
             pred_imgs.append(y_hat)
+
+        end_vllm = time.time_ns()
 
         pred_imgs = torch.concat(pred_imgs, dim=0)
 
@@ -93,7 +129,21 @@ class GeospatialDeployment():
         # Squeeze (batch size 1)
         pred_imgs = pred_imgs[0]
 
-        return pred_imgs
+        end_encode = time.time_ns()
+
+        timestamps = {
+            "start_encode": start_encode,
+            "end_preprocessor": end_preprocessor,
+            "end_sleep": end_sleep,
+            "submission_timestamps": submission_timestamps,
+            "submitted_all_vllm_tasks": submitted_all_vllm_tasks,
+            "reception_timestamps": reception_timestamps,
+            "end_vllm": end_vllm,
+            "end_encode": end_encode,
+        }
+
+        return pred_imgs, timestamps
+
 
     def init_object_from_classpath_and_args(self, class_name: str, init_args: dict):
         class_parts = class_name.split('.')
@@ -230,7 +280,6 @@ class GeospatialDeployment():
                 # Cannot read coords
                 coords = None
         return img, meta, coords
-
 
     @staticmethod
     async def read_geotiff_async(file_path: str) -> Tuple[np.ndarray, dict, Tuple[float, float]]:
